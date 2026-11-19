@@ -1,32 +1,33 @@
 
+import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
-# Project directory
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+# --------------------------------------------------
+# PROJECT CONFIGURATION
+# --------------------------------------------------
 
-# Input and output files
-INPUT_FILE = (
-    PROJECT_DIR
-    / "data"
-    / "processed"
-    / "software_engineering"
-    / "pages.jsonl"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-OUTPUT_FILE = (
-    PROJECT_DIR
-    / "data"
-    / "processed"
-    / "software_engineering"
-    / "chunks.jsonl"
-)
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# Chunk configuration
+from app.subject_manager import SubjectManager
+
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 
+# Preserve existing chunk ID prefixes
+LEGACY_PREFIXES = {
+    "software_engineering": "SE",
+    "dbms": "DBMS"
+}
+
+
+# --------------------------------------------------
+# TEXT CLEANING
+# --------------------------------------------------
 
 def clean_text(text):
     """Remove unnecessary whitespace and normalize text."""
@@ -36,6 +37,10 @@ def clean_text(text):
 
     return text.strip()
 
+
+# --------------------------------------------------
+# TEXT CHUNKING
+# --------------------------------------------------
 
 def split_into_chunks(text):
     """Split text into overlapping chunks."""
@@ -47,23 +52,29 @@ def split_into_chunks(text):
 
         end = min(start + CHUNK_SIZE, len(text))
 
-        # Try to end at a sentence boundary
         if end < len(text):
+
             search_start = start + int(CHUNK_SIZE * 0.5)
 
             boundaries = [
                 text.rfind(". ", search_start, end),
                 text.rfind("? ", search_start, end),
-                text.rfind("! ", search_start, end),
+                text.rfind("! ", search_start, end)
             ]
 
             boundary = max(boundaries)
 
             if boundary != -1:
+
                 end = boundary + 1
+
             else:
-                # Fall back to a word boundary
-                space = text.rfind(" ", search_start, end)
+
+                space = text.rfind(
+                    " ",
+                    search_start,
+                    end
+                )
 
                 if space != -1:
                     end = space
@@ -76,8 +87,10 @@ def split_into_chunks(text):
         if end >= len(text):
             break
 
-        # Move forward while retaining overlap
-        next_start = max(start + 1, end - CHUNK_OVERLAP)
+        next_start = max(
+            start + 1,
+            end - CHUNK_OVERLAP
+        )
 
         while next_start < end and text[next_start].isspace():
             next_start += 1
@@ -87,68 +100,155 @@ def split_into_chunks(text):
     return chunks
 
 
-def process_textbook():
+# --------------------------------------------------
+# SUBJECT CHUNK PROCESSING
+# --------------------------------------------------
 
-    if not INPUT_FILE.exists():
-        raise FileNotFoundError(
-            f"Input file not found: {INPUT_FILE}"
+def process_textbook(subject_slug):
+
+    manager = SubjectManager()
+
+    subject = manager.get_subject(subject_slug)
+
+    if subject is None:
+        raise ValueError(
+            f"Subject '{subject_slug}' is not registered."
         )
 
+    subject_name = subject["name"]
+
+    # Preserve old chunk IDs for existing subjects
+    prefix = LEGACY_PREFIXES.get(
+        subject_slug,
+        subject_slug.upper()
+    )
+
+    subject_dir = (
+        PROJECT_ROOT
+        / "data"
+        / "processed"
+        / subject_slug
+    )
+
+    input_file = subject_dir / "pages.jsonl"
+    output_file = subject_dir / "chunks.jsonl"
+
+    if not input_file.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_file}"
+        )
+
+    print(f"Processing subject: {subject_name}")
     print("Reading extracted textbook data...")
-
-    records = []
-
-    with open(INPUT_FILE, "r", encoding="utf-8") as file:
-        for line in file:
-            records.append(json.loads(line))
-
-    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     total_chunks = 0
     total_characters = 0
+    total_pages = 0
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as output:
+    subject_dir.mkdir(parents=True, exist_ok=True)
 
-        for record in records:
+    with open(
+        input_file,
+        "r",
+        encoding="utf-8"
+    ) as source:
 
-            page_number = record["page"]
+        with open(
+            output_file,
+            "w",
+            encoding="utf-8"
+        ) as output:
 
-            text = clean_text(record["text"])
+            for line in source:
 
-            page_chunks = split_into_chunks(text)
+                if not line.strip():
+                    continue
 
-            for index, chunk in enumerate(page_chunks, start=1):
+                record = json.loads(line)
 
-                chunk_record = {
-                    "chunk_id": f"SE-P{page_number}-C{index}",
-                    "subject": record["subject"],
-                    "source": record["source"],
-                    "page": page_number,
-                    "text": chunk,
-                    "character_count": len(chunk)
-                }
+                total_pages += 1
 
-                output.write(
-                    json.dumps(
-                        chunk_record,
-                        ensure_ascii=False
-                    ) + "\n"
-                )
+                page_number = record["page"]
 
-                total_chunks += 1
-                total_characters += len(chunk)
+                text = clean_text(record["text"])
 
-            if page_number % 100 == 0:
-                print(
-                    f"Processed {page_number}/{len(records)} pages"
-                )
+                page_chunks = split_into_chunks(text)
+
+                for index, chunk in enumerate(
+                    page_chunks,
+                    start=1
+                ):
+
+                    chunk_record = {
+                        "chunk_id": (
+                            f"{prefix}-P{page_number}-C{index}"
+                        ),
+                        "subject": subject_name,
+                        "subject_id": subject_slug,
+                        "source": record.get(
+                            "source",
+                            "Unknown textbook"
+                        ),
+                        "page": page_number,
+                        "text": chunk,
+                        "character_count": len(chunk)
+                    }
+
+                    output.write(
+                        json.dumps(
+                            chunk_record,
+                            ensure_ascii=False
+                        ) + "\n"
+                    )
+
+                    total_chunks += 1
+                    total_characters += len(chunk)
+
+                if page_number % 100 == 0:
+                    print(
+                        f"Processed PDF page {page_number}"
+                    )
+
+    if total_chunks == 0:
+        output_file.unlink(missing_ok=True)
+
+        raise ValueError(
+            "No text chunks were generated. "
+            "Check the extracted pages file."
+        )
 
     print("\nChunking completed!")
-    print(f"Pages processed: {len(records)}")
+    print(f"Subject: {subject_name}")
+    print(f"Pages with extracted text: {total_pages}")
     print(f"Total chunks generated: {total_chunks}")
     print(f"Total characters: {total_characters}")
-    print(f"Output saved to: {OUTPUT_FILE}")
+    print(f"Output saved to: {output_file}")
 
+    return {
+        "subject": subject_name,
+        "total_pages": total_pages,
+        "total_chunks": total_chunks,
+        "total_characters": total_characters,
+        "output_file": str(output_file)
+    }
+
+
+# --------------------------------------------------
+# COMMAND LINE INTERFACE
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    process_textbook()
+
+    parser = argparse.ArgumentParser(
+        description="Chunk textbook content dynamically by subject."
+    )
+
+    parser.add_argument(
+        "--subject",
+        required=True,
+        help="Registered subject ID, e.g. operating_systems"
+    )
+
+    args = parser.parse_args()
+
+    process_textbook(args.subject)

@@ -1,125 +1,400 @@
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 from fastembed import TextEmbedding
 
+# --------------------------------------------------
+# PROJECT CONFIGURATION
+# --------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DATA_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "software_engineering"
-)
+sys.path.insert(0, str(PROJECT_ROOT))
 
-EMBEDDINGS_FILE = DATA_DIR / "embeddings.npy"
-METADATA_FILE = DATA_DIR / "embedding_metadata.jsonl"
+from app.subject_manager import SubjectManager
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EXPECTED_DIMENSIONS = 384
 
+
+# --------------------------------------------------
+# SEMANTIC RETRIEVER
+# --------------------------------------------------
 
 class SemanticRetriever:
+
     def __init__(self):
-        print("Loading stored embeddings...")
 
-        self.embeddings = np.load(EMBEDDINGS_FILE)
+        print("Loading embedding model...")
 
-        with open(METADATA_FILE, "r", encoding="utf-8") as file:
-            self.metadata = [
+        self.model = TextEmbedding(
+            model_name=MODEL_NAME
+        )
+
+        self.subject_manager = SubjectManager()
+
+        # Cache data separately for each subject
+        self.subject_data = {}
+
+        print("Semantic retriever initialized.")
+
+    # --------------------------------------------------
+    # RESOLVE SUBJECT
+    # --------------------------------------------------
+
+    def _resolve_subject(self, subject):
+
+        if not subject or not str(subject).strip():
+            raise ValueError("Subject cannot be empty.")
+
+        subjects = self.subject_manager.get_subjects()
+
+        subject_key = str(subject).strip().casefold()
+
+        for item in subjects:
+
+            if (
+                item["slug"].casefold() == subject_key
+                or item["name"].casefold() == subject_key
+            ):
+
+                return item
+
+        available = ", ".join(
+            item["name"] for item in subjects
+        )
+
+        raise ValueError(
+            f"Unsupported subject: {subject}. "
+            f"Registered subjects: {available}"
+        )
+
+    # --------------------------------------------------
+    # LOAD SUBJECT DATA
+    # --------------------------------------------------
+
+    def _load_subject_data(self, subject):
+
+        subject_info = self._resolve_subject(subject)
+
+        folder_name = subject_info["slug"]
+
+        # Only processed subjects can be searched
+        if subject_info["status"] != "ready":
+
+            raise ValueError(
+                f"{subject_info['name']} is not ready yet. "
+                "Upload and process its textbook first."
+            )
+
+        # Return cached data if already loaded
+        if folder_name in self.subject_data:
+
+            return self.subject_data[folder_name]
+
+        data_dir = (
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / folder_name
+        )
+
+        embeddings_file = data_dir / "embeddings.npy"
+        metadata_file = data_dir / "embedding_metadata.jsonl"
+        chunks_file = data_dir / "chunks.jsonl"
+
+        required_files = [
+            embeddings_file,
+            metadata_file,
+            chunks_file
+        ]
+
+        for file_path in required_files:
+
+            if not file_path.exists():
+
+                raise FileNotFoundError(
+                    f"Required processed file not found: {file_path}"
+                )
+
+        print(
+            f"Loading data for: {subject_info['name']}"
+        )
+
+        # Load numerical embeddings
+        embeddings = np.load(
+            embeddings_file,
+            allow_pickle=False
+        )
+
+        # Load metadata
+        with open(
+            metadata_file,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            metadata = [
                 json.loads(line)
                 for line in file
                 if line.strip()
             ]
 
-        if len(self.embeddings) != len(self.metadata):
-            raise ValueError("Embedding and metadata counts do not match.")
+        # Load chunk text
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as file:
 
-        print("Loading embedding model...")
-        self.model = TextEmbedding(model_name=MODEL_NAME)
+            chunks = {
+                chunk["chunk_id"]: chunk["text"]
+                for line in file
+                if line.strip()
+                for chunk in [json.loads(line)]
+            }
 
-        print(f"Loaded {len(self.metadata)} textbook chunks.")
+        # --------------------------------------------------
+        # DATA VALIDATION
+        # --------------------------------------------------
 
-    def search(self, question, subject="Software Engineering", top_k=5):
-        if not question.strip():
-            raise ValueError("Question cannot be empty.")
+        if embeddings.ndim != 2:
 
-        # Convert the student's question into a vector
+            raise ValueError(
+                "Embeddings must be a 2D array."
+            )
+
+        if embeddings.shape[1] != EXPECTED_DIMENSIONS:
+
+            raise ValueError(
+                f"Expected {EXPECTED_DIMENSIONS} dimensions, "
+                f"received {embeddings.shape[1]}."
+            )
+
+        if len(embeddings) == 0:
+
+            raise ValueError(
+                "No embeddings found for this subject."
+            )
+
+        if not np.isfinite(embeddings).all():
+
+            raise ValueError(
+                "Embeddings contain invalid numerical values."
+            )
+
+        if len(embeddings) != len(metadata):
+
+            raise ValueError(
+                "Embedding and metadata counts do not match."
+            )
+
+        if len(chunks) != len(metadata):
+
+            raise ValueError(
+                "Chunk and metadata counts do not match."
+            )
+
+        # Ensure metadata and chunk IDs correspond
+        for item in metadata:
+
+            if item["chunk_id"] not in chunks:
+
+                raise ValueError(
+                    f"Missing chunk text: {item['chunk_id']}"
+                )
+
+        # Verify metadata belongs to selected subject
+        for item in metadata:
+
+            metadata_subject = item.get(
+                "subject_id",
+                folder_name
+            )
+
+            if metadata_subject != folder_name:
+
+                raise ValueError(
+                    "Metadata contains a different subject ID."
+                )
+
+        # Cache the loaded subject data
+        self.subject_data[folder_name] = {
+            "embeddings": embeddings,
+            "metadata": metadata,
+            "chunks": chunks
+        }
+
+        print(
+            f"Loaded {len(metadata)} chunks "
+            f"for {subject_info['name']}."
+        )
+
+        return self.subject_data[folder_name]
+
+    # --------------------------------------------------
+    # SEMANTIC SEARCH
+    # --------------------------------------------------
+
+    def search(
+        self,
+        question,
+        subject="Software Engineering",
+        top_k=5
+    ):
+
+        if not question or not question.strip():
+
+            raise ValueError(
+                "Question cannot be empty."
+            )
+
+        if top_k < 1:
+
+            raise ValueError(
+                "top_k must be at least 1."
+            )
+
+        # Resolve and load selected subject
+        subject_info = self._resolve_subject(subject)
+
+        data = self._load_subject_data(
+            subject_info["slug"]
+        )
+
+        embeddings = data["embeddings"]
+        metadata = data["metadata"]
+        chunks = data["chunks"]
+
+        # Convert question into an embedding
         query_vector = np.array(
-            list(self.model.embed([question])),
+            list(
+                self.model.embed([question])
+            ),
             dtype=np.float32
         )[0]
 
-        # Filter chunks by the selected subject
-        subject_indices = [
-            i for i, item in enumerate(self.metadata)
-            if item["subject"].casefold() == subject.casefold()
-        ]
+        query_norm = np.linalg.norm(query_vector)
 
-        if not subject_indices:
-            return []
+        if query_norm == 0:
 
-        subject_embeddings = self.embeddings[subject_indices]
+            raise ValueError(
+                "Question embedding has zero magnitude."
+            )
 
         # Calculate cosine similarity
-        query_norm = np.linalg.norm(query_vector)
         embedding_norms = np.linalg.norm(
-            subject_embeddings, axis=1
+            embeddings,
+            axis=1
         )
 
         similarities = (
-            subject_embeddings @ query_vector
-        ) / (embedding_norms * query_norm + 1e-10)
+            embeddings @ query_vector
+        ) / (
+            embedding_norms * query_norm + 1e-10
+        )
 
-        # Select the most relevant chunks
-        top_positions = np.argsort(similarities)[::-1][:top_k]
+        # Select top matching chunks
+        result_count = min(
+            top_k,
+            len(similarities)
+        )
+
+        top_positions = np.argsort(
+            similarities
+        )[::-1][:result_count]
 
         results = []
 
         for position in top_positions:
-            original_index = subject_indices[position]
+
+            item = metadata[position]
 
             results.append({
-                **self.metadata[original_index],
-                "similarity": float(similarities[position]),
-                "text": self._get_chunk_text(
-                    self.metadata[original_index]["chunk_id"]
-                )
+                **item,
+                "similarity": float(
+                    similarities[position]
+                ),
+                "text": chunks[item["chunk_id"]]
             })
 
         return results
 
-    def _get_chunk_text(self, chunk_id):
-        chunks_file = DATA_DIR / "chunks.jsonl"
 
-        with open(chunks_file, "r", encoding="utf-8") as file:
-            for line in file:
-                chunk = json.loads(line)
-
-                if chunk["chunk_id"] == chunk_id:
-                    return chunk["text"]
-
-        return ""
-
+# --------------------------------------------------
+# COMMAND LINE INTERFACE
+# --------------------------------------------------
 
 if __name__ == "__main__":
+
+    manager = SubjectManager()
+
     retriever = SemanticRetriever()
 
-    question = input("\nEnter your question: ")
+    subjects = [
+        item
+        for item in manager.get_subjects()
+        if item["status"] == "ready"
+    ]
+
+    print("\nAvailable processed subjects:")
+
+    for index, item in enumerate(subjects, start=1):
+
+        print(f"{index}. {item['name']}")
+
+    if not subjects:
+
+        raise ValueError(
+            "No processed subjects are available."
+        )
+
+    choice = input(
+        "\nSelect subject number: "
+    ).strip()
+
+    if not choice.isdigit():
+
+        raise ValueError(
+            "Please enter a valid subject number."
+        )
+
+    choice_number = int(choice)
+
+    if not 1 <= choice_number <= len(subjects):
+
+        raise ValueError(
+            "Invalid subject selection."
+        )
+
+    selected_subject = subjects[
+        choice_number - 1
+    ]
+
+    question = input(
+        "\nEnter your question: "
+    )
 
     results = retriever.search(
         question,
-        subject="Software Engineering",
+        subject=selected_subject["slug"],
         top_k=5
     )
 
-    print("\nMost relevant textbook passages:\n")
+    print(
+        f"\nMost relevant {selected_subject['name']} passages:\n"
+    )
 
     for rank, result in enumerate(results, start=1):
+
         print(f"\n--- Result {rank} ---")
+        print(f"Subject: {result['subject']}")
         print(f"Page: {result['page']}")
-        print(f"Similarity: {result['similarity']:.4f}")
+        print(
+            f"Similarity: {result['similarity']:.4f}"
+        )
         print(f"Chunk ID: {result['chunk_id']}")
         print(f"Text:\n{result['text']}")

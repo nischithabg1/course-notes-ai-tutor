@@ -1,38 +1,63 @@
 
-import pymupdf as fitz
+import argparse
 import json
+import sys
 from pathlib import Path
 
-# Project paths
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+import pymupdf as fitz
 
-PDF_PATH = (
-    PROJECT_DIR
-    / "data"
-    / "raw"
-    / "software_engineering"
-    / "software_engineering.pdf"
-)
+# --------------------------------------------------
+# PROJECT PATH CONFIGURATION
+# --------------------------------------------------
 
-OUTPUT_DIR = (
-    PROJECT_DIR
-    / "data"
-    / "processed"
-    / "software_engineering"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-OUTPUT_FILE = OUTPUT_DIR / "pages.jsonl"
+# Add project root to Python import path
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.subject_manager import SubjectManager
 
 
-def extract_text():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------
+# PDF EXTRACTION
+# --------------------------------------------------
 
-    if not PDF_PATH.exists():
-        raise FileNotFoundError(f"PDF not found: {PDF_PATH}")
+def extract_text(subject_slug, pdf_path):
 
+    manager = SubjectManager()
+    subject = manager.get_subject(subject_slug)
+
+    if subject is None:
+        raise ValueError(
+            f"Subject '{subject_slug}' is not registered."
+        )
+
+    pdf_path = Path(pdf_path).resolve()
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(
+            f"PDF not found: {pdf_path}"
+        )
+
+    if pdf_path.suffix.lower() != ".pdf":
+        raise ValueError("Only PDF files are supported.")
+
+    output_dir = (
+        PROJECT_ROOT
+        / "data"
+        / "processed"
+        / subject_slug
+    )
+
+    output_file = output_dir / "pages.jsonl"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Subject: {subject['name']}")
+    print(f"PDF: {pdf_path.name}")
     print("Opening textbook...")
 
-    pdf = fitz.open(PDF_PATH)
+    pdf = fitz.open(pdf_path)
 
     total_pages = len(pdf)
     extracted_pages = 0
@@ -40,42 +65,100 @@ def extract_text():
 
     print(f"Total PDF pages: {total_pages}")
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as output:
+    try:
 
-        for page_index, page in enumerate(pdf):
+        with open(
+            output_file,
+            "w",
+            encoding="utf-8"
+        ) as output:
 
-            page_number = page_index + 1
+            for page_index, page in enumerate(pdf):
 
-            text = page.get_text("text", sort=True).strip()
+                page_number = page_index + 1
 
-            if not text:
-                empty_pages += 1
-                continue
+                text = page.get_text(
+                    "text",
+                    sort=True
+                ).strip()
 
-            record = {
-                "subject": "Software Engineering",
-                "source": "Software Engineering, 10th Edition",
-                "page": page_number,
-                "text": text
-            }
+                if not text:
+                    empty_pages += 1
+                    continue
 
-            output.write(
-                json.dumps(record, ensure_ascii=False) + "\n"
-            )
+                record = {
+                    "subject": subject["name"],
+                    "subject_id": subject_slug,
+                    "source": pdf_path.name,
+                    "page": page_number,
+                    "text": text
+                }
 
-            extracted_pages += 1
+                output.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
 
-            if page_number % 50 == 0:
-                print(f"Processed {page_number}/{total_pages} pages")
+                extracted_pages += 1
 
-    pdf.close()
+                if page_number % 50 == 0:
+                    print(
+                        f"Processed {page_number}/{total_pages} pages"
+                    )
+
+    finally:
+        pdf.close()
+
+    if extracted_pages == 0:
+        output_file.unlink(missing_ok=True)
+
+        raise ValueError(
+            "No extractable text was found in the PDF. "
+            "The document may be scanned and require OCR."
+        )
 
     print("\nExtraction completed!")
+    print(f"Subject: {subject['name']}")
     print(f"Total pages: {total_pages}")
     print(f"Pages with extracted text: {extracted_pages}")
     print(f"Empty pages: {empty_pages}")
-    print(f"Output saved to: {OUTPUT_FILE}")
+    print(f"Output saved to: {output_file}")
 
+    return {
+        "total_pages": total_pages,
+        "extracted_pages": extracted_pages,
+        "empty_pages": empty_pages,
+        "output_file": str(output_file)
+    }
+
+
+# --------------------------------------------------
+# COMMAND LINE INTERFACE
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    extract_text()
+
+    parser = argparse.ArgumentParser(
+        description="Extract text from a subject textbook PDF."
+    )
+
+    parser.add_argument(
+        "--subject",
+        required=True,
+        help="Registered subject ID, e.g. operating_systems"
+    )
+
+    parser.add_argument(
+        "--pdf",
+        required=True,
+        help="Path to the textbook PDF"
+    )
+
+    args = parser.parse_args()
+
+    extract_text(
+        subject_slug=args.subject,
+        pdf_path=args.pdf
+    )

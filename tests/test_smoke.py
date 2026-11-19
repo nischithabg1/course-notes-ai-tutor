@@ -1,28 +1,96 @@
-"""These pass on day one. They check the plumbing so you notice quickly if you break it."""
-import os
 
-from app import llm
-from app.storage import Store
+from app.storage import ChatStorage
+from app.subject_manager import SubjectManager
 
 
-def test_the_store_keeps_what_you_put_in_it(tmp_path):
-    store = Store(str(tmp_path / "app.json"))
-    store.put("hello", {"n": 1})
-    assert store.get("hello") == {"n": 1}
-    assert store.get("missing", "fallback") == "fallback"
-    assert store.all() == {"hello": {"n": 1}}
+def test_chat_storage_creates_and_retrieves_conversation(tmp_path):
+    storage = ChatStorage(str(tmp_path / "test_chat.db"))
+
+    conversation_id = storage.create_conversation(
+        subject="DBMS",
+        title="Test conversation"
+    )
+
+    storage.add_message(
+        conversation_id=conversation_id,
+        role="user",
+        content="What is DBMS?"
+    )
+
+    messages = storage.get_messages(conversation_id)
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "What is DBMS?"
 
 
-def test_model_settings_default_to_a_local_ollama(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)                  # no .env here
-    for name in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.delenv(name, raising=False)
-    base, key, model = llm.settings()
-    assert base == "http://localhost:11434/v1" and key == "" and model == ""
+def test_chat_storage_deletes_conversation(tmp_path):
+    storage = ChatStorage(str(tmp_path / "test_chat.db"))
+
+    conversation_id = storage.create_conversation(
+        subject="DBMS",
+        title="Delete test"
+    )
+
+    storage.delete_conversation(conversation_id)
+
+    assert storage.get_conversation(conversation_id) is None
 
 
-def test_the_command_line_runs(capsys):
-    from app.cli import main
-    main(["hello"])
-    assert "is ready" in capsys.readouterr().out
+def test_subject_manager_creates_unique_subject(tmp_path, monkeypatch):
+    import app.subject_manager as subject_module
 
+    monkeypatch.setattr(
+        subject_module,
+        "SUBJECTS_FILE",
+        tmp_path / "subjects.json"
+    )
+
+    manager = SubjectManager()
+
+    subject = manager.add_subject("Computer Networks")
+
+    assert subject["name"] == "Computer Networks"
+    assert subject["slug"] == "computer_networks"
+    assert subject["status"] == "pending"
+
+
+def test_subject_manager_updates_status(tmp_path, monkeypatch):
+    import app.subject_manager as subject_module
+
+    monkeypatch.setattr(
+        subject_module,
+        "SUBJECTS_FILE",
+        tmp_path / "subjects.json"
+    )
+
+    manager = SubjectManager()
+
+    subject = manager.add_subject("Operating Systems")
+
+    updated = manager.update_status(
+        subject["slug"],
+        "ready"
+    )
+
+    assert updated["status"] == "ready"
+
+
+def test_subject_manager_rejects_duplicate_subject(tmp_path, monkeypatch):
+    import app.subject_manager as subject_module
+
+    monkeypatch.setattr(
+        subject_module,
+        "SUBJECTS_FILE",
+        tmp_path / "subjects.json"
+    )
+
+    manager = SubjectManager()
+
+    manager.add_subject("Computer Networks")
+
+    try:
+        manager.add_subject("Computer Networks")
+        assert False, "Duplicate subject should be rejected."
+    except ValueError as error:
+        assert "already exists" in str(error)
